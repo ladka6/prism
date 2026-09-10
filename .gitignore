@@ -1,0 +1,11 @@
+/data
+/logs
+/prism
+/.venv
+/venv
+/__pycache__
+**/__pycache__/
+*.pyc
+.DS_Store
+# SLURM output logs
+*.out
