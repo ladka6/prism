@@ -152,6 +152,14 @@ class DataManager(object):
             order = np.random.permutation(len(order)).tolist()
         else:
             order = idata.class_order
+        perm_seed = self.args.get("task_perm_seed")
+        if perm_seed is not None:
+            # Same class->task partition, tasks presented in a different order.
+            inc = int(self.args["increment"])
+            assert int(self.args["init_cls"]) == inc and len(order) % inc == 0
+            blocks = np.array(order).reshape(-1, inc)
+            blocks = blocks[np.random.RandomState(int(perm_seed)).permutation(len(blocks))]
+            order = blocks.reshape(-1).tolist()
         self._class_order = order
         logging.info(self._class_order)
 

@@ -65,6 +65,8 @@ def _train(args):
 
     cnn_curve, nme_curve = {"top1": [], "top5": []}, {"top1": [], "top5": []}
     cnn_matrix, nme_matrix = [], []
+    # Rebuttal instrumentation. Line formats match tosca-eval's routing_report.py.
+    routing_curve = {"acc": [], "cond": [], "ms": [], "fit_s": [], "peak_mb": []}
 
     for task in range(data_manager.nb_tasks):
         logging.info("All params: {}".format(count_parameters(model._network)))
@@ -73,6 +75,7 @@ def _train(args):
         )
         model.incremental_train(data_manager)
         cnn_accy, nme_accy = model.eval_task()
+        _log_routing(model, routing_curve)
         model.after_task()
 
         if nme_accy is not None:
@@ -141,6 +144,25 @@ def _train(args):
             print('Accuracy Matrix (NME):')
             print(np_acctable)
         logging.info('Forgetting (NME): {}'.format(forgetting))
+
+
+def _log_routing(model, curve):
+    m = getattr(model, "metrics", {})
+    if "routing_acc" not in m:
+        return
+    curve["acc"].append(round(m["routing_acc"], 2))
+    curve["cond"].append(round(m["acc_given_correct_routing"], 2))
+    curve["ms"].append(round(m["eval_ms_per_sample"], 3))
+    cost = model.router_cost[-1] if getattr(model, "router_cost", None) else {}
+    curve["fit_s"].append(cost.get("fit_s", 0.0))
+    curve["peak_mb"].append(cost.get("peak_mb", 0.0))
+    logging.info("Routing acc curve: {}".format(curve["acc"]))
+    logging.info("Acc | correct routing curve: {}".format(curve["cond"]))
+    logging.info("Per-task routing acc (stage {}): {}".format(
+        len(curve["acc"]), m["routing_per_task"]))
+    logging.info("Eval ms/sample curve: {}".format(curve["ms"]))
+    logging.info("Router fit time (s) curve: {}".format(curve["fit_s"]))
+    logging.info("Router peak mem (MB) curve: {}".format(curve["peak_mb"]))
 
 
 def _set_device(args):

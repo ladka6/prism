@@ -5,6 +5,7 @@ head (see backbone/vit_prism.py)."""
 import logging
 import os
 import re
+import time
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -15,9 +16,19 @@ from torch.utils.data import DataLoader
 from utils.inc_net import SimpleVitNet
 from backbone.linears import CosineLinear
 from models.base import BaseLearner
+from models.router import RidgeRouter
 from utils.toolkit import tensor2numpy
 
 num_workers = 10
+
+# How the task is chosen at inference. "class_max" is the default and is what
+# the reported numbers use; the others are rebuttal ablations.
+#   class_max : ridge over class labels, task score = max class score in task
+#   class_sum : ridge over class labels, task score = sum of class scores
+#   task      : ridge over task labels (T columns)
+#   entropy   : per-sample lowest-entropy expert (evaluates every expert)
+#   oracle    : ground-truth task (upper bound)
+ROUTER_MODES = ("class_max", "class_sum", "task", "entropy", "oracle")
 
 
 class Learner(BaseLearner):
@@ -32,9 +43,15 @@ class Learner(BaseLearner):
         self._expert_head_cache = {}
 
         self._ridge_P = None  # [feat_dim, M] fixed random projection
-        self._ridge_W_cache = {}  # ("__global__", lambda) -> [M, total_classes]
-        self._ridge_G_global = None  # [M, M]
-        self._ridge_C_global = None  # [M, total_classes]
+        self._router = RidgeRouter()
+
+        self._router_mode = str(args.get("router_mode", "class_max"))
+        if self._router_mode not in ROUTER_MODES:
+            raise ValueError(f"Unknown router_mode {self._router_mode!r}")
+
+        # Per-stage measurements, read by trainer.py.
+        self.metrics = {}
+        self.router_cost = []  # one dict per task: fit seconds, peak MB
 
     def incremental_train(self, data_manager):
         self._setup_task_loaders(data_manager)
@@ -207,6 +224,19 @@ class Learner(BaseLearner):
             self._expert_head_cache[idx] = state
         return state
 
+    def _expert_scores(self, vit_features, task_idx):
+        """Scores of task `task_idx`'s expert over its own classes: [B, inc]."""
+        self._load_adapter(task_idx)
+        feats = self._get_backbone().forward_adapter(vit_features)
+        head = self._load_expert_head(task_idx)
+        weight = head["weight"].to(vit_features.device)
+        scores = F.linear(
+            F.normalize(feats, p=2, dim=1), F.normalize(weight, p=2, dim=1)
+        )
+        if "sigma" in head:
+            scores = head["sigma"].to(vit_features.device) * scores
+        return scores
+
     def _routed_ridge_from_tasks(self, vit_features, topk_tasks):
         inc = self._classes_per_task()
         device = vit_features.device
@@ -220,80 +250,126 @@ class Learner(BaseLearner):
         for task_idx in torch.unique(topk_tasks).tolist():
             task_idx = int(task_idx)
             row_ids = (topk_tasks == task_idx).any(dim=1).nonzero(as_tuple=True)[0]
-            self._load_adapter(task_idx)
-            feats = self._get_backbone().forward_adapter(vit_features[row_ids])
-            head = self._load_expert_head(task_idx)
-            weight = head["weight"].to(device)
-            scores = F.linear(
-                F.normalize(feats, p=2, dim=1), F.normalize(weight, p=2, dim=1)
-            )
-            if "sigma" in head:
-                scores = head["sigma"].to(device) * scores
+            scores = self._expert_scores(vit_features[row_ids], task_idx)
             start = int(starts[task_idx].item())
             out_logits[row_ids, start : start + inc] = scores
         return out_logits
 
-    def _task_scores_from_logits(self, logits):
+    def _entropy_routed(self, vit_features):
+        """Per-sample lowest-entropy expert. Evaluates every stored expert on
+        the cached [CLS] feature. Returns (logits [B, total], chosen [B])."""
+        inc = self._classes_per_task()
+        n_tasks = len(self._task_ranges)
+        scores = [self._expert_scores(vit_features, t) for t in range(n_tasks)]
+        entropy = torch.stack(
+            [
+                -(F.softmax(s, dim=1) * torch.log(F.softmax(s, dim=1) + 1e-9)).sum(1)
+                for s in scores
+            ]
+        )  # [T, B]
+        chosen = entropy.argmin(dim=0)
+        out = torch.full(
+            (vit_features.size(0), self._total_classes),
+            float("-inf"),
+            device=vit_features.device,
+        )
+        for t, (start, _) in enumerate(self._task_ranges):
+            rows = (chosen == t).nonzero(as_tuple=True)[0]
+            out[rows, start : start + inc] = scores[t][rows]
+        return out, chosen
+
+    def _task_scores_from_logits(self, logits, reduce="max"):
         device = logits.device
         scores = torch.full(
             (logits.size(0), len(self._task_ranges)), float("-inf"), device=device
         )
         for t, (start, end) in enumerate(self._task_ranges):
-            scores[:, t] = logits[:, start:end].max(dim=1).values
+            block = logits[:, start:end]
+            scores[:, t] = block.max(dim=1).values if reduce == "max" else block.sum(1)
         return scores
 
+    def _true_task(self, targets):
+        ends = np.array([e for _, e in self._task_ranges])
+        return np.searchsorted(ends, targets.cpu().numpy(), side="right")
+
+    def _ridge_task(self, vit_features):
+        """Task chosen by the ridge router in the configured mode: [B]."""
+        lam = float(self.args.get("ridge_lambda", 1e4))
+        ridge_out = self._ridge_features(vit_features) @ self._router.weight(lam)
+        if self._router_mode == "task":
+            return ridge_out.argmax(dim=1)
+        reduce = "sum" if self._router_mode == "class_sum" else "max"
+        return self._task_scores_from_logits(ridge_out, reduce).argmax(dim=1)
+
+    def _routed_logits(self, inputs, targets):
+        """Returns (logits, chosen_task) for the configured router_mode."""
+        vit_features = self._extract_backbone_features(inputs)
+        if self._router_mode == "entropy":
+            return self._entropy_routed(vit_features)
+        if self._router_mode == "oracle":
+            chosen = torch.as_tensor(self._true_task(targets), device=inputs.device)
+        else:
+            chosen = self._ridge_task(vit_features)
+        return self._routed_ridge_from_tasks(vit_features, chosen[:, None]), chosen
+
     def _get_global_routed_ridge_logits(self, inputs, lam=None):
+        # Kept for external callers; same as the default class_max path.
         if lam is None:
             lam = float(self.args.get("ridge_lambda", 1e4))
         vit_features = self._extract_backbone_features(inputs)
-        global_logits = self._ridge_features(vit_features) @ self._global_ridge_weight(
-            lam
-        )
+        global_logits = self._ridge_features(vit_features) @ self._router.weight(lam)
         task_scores = self._task_scores_from_logits(global_logits)
         top1_task = task_scores.argmax(dim=1, keepdim=True)  # [B, 1]
         return self._routed_ridge_from_tasks(vit_features, top1_task)
 
-    def _accumulate_global_ridge(self, frozen, labels):
-        total = self._total_classes
-        frozen = frozen.to(self._device)
-        labels = labels.to(self._device).long()
-        phi = self._ridge_features(frozen)  # [N, M]
-        onehot = torch.zeros(phi.size(0), total, device=self._device)
-        onehot[torch.arange(phi.size(0), device=self._device), labels] = 1.0
-        G = (phi.t() @ phi).float()
-        C = (phi.t() @ onehot).float()
-        if self._ridge_G_global is None:
-            self._ridge_G_global = G
-            self._ridge_C_global = C
-        else:
-            self._ridge_G_global = self._ridge_G_global + G
-            prev = self._ridge_C_global
-            grown = torch.zeros(prev.size(0), total, device=self._device)
-            grown[:, : prev.size(1)] = prev
-            self._ridge_C_global = grown + C
-        self._ridge_W_cache.clear()
-        logging.info(
-            "Global ridge accumulated Task %s: M=%d, N=%d, classes=%d.",
-            self._cur_task,
-            phi.size(1),
-            phi.size(0),
-            total,
-        )
-
-    def _global_ridge_weight(self, lam):
-        key = ("__global__", float(lam))
-        W = self._ridge_W_cache.get(key)
-        if W is None:
-            G = self._ridge_G_global.double()
-            C = self._ridge_C_global.double()
-            eye = torch.eye(G.size(0), device=G.device, dtype=G.dtype)
-            W = torch.linalg.solve(G + float(lam) * eye, C).float()
-            self._ridge_W_cache[key] = W
-        return W
-
     def after_task(self):
         self._network.backbone.reset_adapter()
         self._known_classes = self._total_classes
+
+    def _sync(self):
+        if self._device.type == "cuda":
+            torch.cuda.synchronize(self._device)
+
+    def _fit_router(self, frozen, labels):
+        """Accumulate this task's statistics and re-solve. Times only the
+        router update (projection, G/C accumulation, solve), not the backbone
+        pass that produced the features, and records its peak GPU memory."""
+        total = self._total_classes
+        if self._router_mode in ("entropy", "oracle"):
+            return  # no ridge router in these arms
+        cuda = self._device.type == "cuda"
+        if cuda:
+            torch.cuda.reset_peak_memory_stats(self._device)
+        base_mb = torch.cuda.memory_allocated(self._device) / 2**20 if cuda else 0.0
+        self._sync()
+        t0 = time.time()
+
+        phi = self._ridge_features(frozen.to(self._device))  # [N, M]
+        if self._router_mode == "task":
+            labels = torch.full_like(labels, self._cur_task)
+            n_out = self._cur_task + 1
+        else:
+            n_out = total
+        self._router.accumulate(phi, labels, n_out)
+        self._router.weight(float(self.args.get("ridge_lambda", 1e4)))
+
+        self._sync()
+        fit_s = time.time() - t0
+        peak_mb = torch.cuda.max_memory_allocated(self._device) / 2**20 if cuda else 0.0
+        cost = {
+            "task": self._cur_task,
+            "fit_s": round(fit_s, 3),
+            "peak_mb": round(peak_mb, 1),
+            "peak_above_base_mb": round(peak_mb - base_mb, 1),
+            "G_mb": round(self._router.G.numel() * 4 / 2**20, 1),
+        }
+        self.router_cost.append(cost)
+        logging.info(
+            "Router cost Task %s: fit %.2fs, peak %.0f MB (%.0f MB above resident), "
+            "M=%d, N=%d, columns=%d.",
+            self._cur_task, fit_s, peak_mb, peak_mb - base_mb,
+            phi.size(1), phi.size(0), n_out,
+        )
 
     def replace_fc(self):
         self._network.eval()
@@ -307,7 +383,7 @@ class Learner(BaseLearner):
                 frozen_list.append(vit.cpu())
                 label_list.append(label.cpu())
         label_list = torch.cat(label_list, dim=0)
-        self._accumulate_global_ridge(torch.cat(frozen_list, dim=0), label_list)
+        self._fit_router(torch.cat(frozen_list, dim=0), label_list)
 
     def get_optimizer(self, lr, extra_params=None):
         params = list(filter(lambda p: p.requires_grad, self._network.parameters()))
@@ -356,21 +432,56 @@ class Learner(BaseLearner):
             )
         return scheduler
 
+    def eval_task(self):
+        # Wall-clock over the whole eval pass / #samples, the same scope as
+        # tosca-eval's "Eval (ms/smp)" (includes data loading).
+        self._sync()
+        t0 = time.time()
+        cnn_accy, nme_accy = super().eval_task()
+        self._sync()
+        n = max(len(self.test_loader.dataset), 1)
+        self.metrics["eval_ms_per_sample"] = (time.time() - t0) / n * 1000
+        return cnn_accy, nme_accy
+
     def _eval_cnn(self, loader):
         self._network.eval()
-        y_pred, y_true = [], []
+        y_pred, y_true, routed, routed_true = [], [], [], []
 
         for _, (_, inputs, targets) in enumerate(loader):
             inputs, targets = inputs.to(self._device), targets.long().to(self._device)
             with torch.no_grad():
-                outputs = self._get_global_routed_ridge_logits(inputs)
+                outputs, chosen = self._routed_logits(inputs, targets)
             predicts = torch.topk(
                 outputs, k=self.topk, dim=1, largest=True, sorted=True
             )[1]
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
+            routed.append(chosen.cpu().numpy())
+            routed_true.append(self._true_task(targets))
 
-        return np.concatenate(y_pred), np.concatenate(y_true)
+        y_pred, y_true = np.concatenate(y_pred), np.concatenate(y_true)
+        self._record_routing(
+            np.concatenate(routed), np.concatenate(routed_true), y_pred[:, 0] == y_true
+        )
+        return y_pred, y_true
+
+    def _record_routing(self, chosen, truth, top1_correct):
+        """Separates 'wrong expert chosen' from 'right expert misclassifies',
+        and saves the task confusion matrix (rows: true task, cols: routed)."""
+        n_tasks = len(self._task_ranges)
+        ok = chosen == truth
+        self.metrics["routing_acc"] = float(ok.mean() * 100)
+        self.metrics["acc_given_correct_routing"] = (
+            float(top1_correct[ok].mean() * 100) if ok.any() else 0.0
+        )
+        conf = np.zeros((n_tasks, n_tasks), dtype=np.int64)
+        np.add.at(conf, (truth, chosen), 1)
+        per_task = conf.diagonal() / np.maximum(conf.sum(1), 1) * 100
+        self.metrics["routing_per_task"] = [round(float(x), 2) for x in per_task]
+        np.save(
+            os.path.join(self._ckpt_dir(), f"routing_confusion_stage{self._cur_task}.npy"),
+            conf,
+        )
 
     def _ckpt_dir(self):
         dataset = str(self.args.get("dataset", "data"))
@@ -406,9 +517,9 @@ class Learner(BaseLearner):
         t = self._cur_task
         ckpt_dir = self._ckpt_dir()
         lam = float(self.args.get("ridge_lambda", 1e4))
-        if self._ridge_G_global is not None:
+        if self._router.G is not None:
             torch.save(
-                {"W": self._global_ridge_weight(lam).cpu(), "lambda": lam},
+                {"W": self._router.weight(lam).cpu(), "lambda": lam},
                 os.path.join(ckpt_dir, "ridge_global.pth"),
             )
         logging.info("Global ridge state saved for task %s.", t)

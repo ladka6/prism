@@ -174,3 +174,23 @@ This project is released under the [MIT License](LICENSE).
 
 We thank the following repository for providing helpful components and functions used in our work:
 [LAMDA-PILOT](https://github.com/sun-hailong/LAMDA-PILOT) — a comprehensive continual learning benchmark toolbox.
+---
+
+## 🔬 Rebuttal experiments (branch `rebuttal`)
+
+Router ablations and instrumentation, selected with `--set key=value` (values are parsed as JSON, else strings):
+
+| key | values | meaning |
+|---|---|---|
+| `router_mode` | `class_max` (default, the reported numbers), `class_sum`, `task`, `entropy`, `oracle` | how the task is chosen |
+| `task_perm_seed` | int | same class→task partition, tasks presented in a permuted order |
+
+```bash
+python main.py --config exps/prism_ina.json --seed 1993 --set router_mode=task --set prefix=task
+sbatch --job-name=prism-ina-entropy scripts/run_arm.sh ina entropy   # one dataset, one arm, 5 seeds
+bash scripts/submit_rebuttal.sh                                      # the whole grid
+python scripts/report.py                                             # mean ± std per (dataset, arm)
+python tests/test_router.py                                          # order-independence, numerically
+```
+
+Each run logs routing accuracy, accuracy given correct routing, per-task routing accuracy, eval ms/sample, router fit time and router peak GPU memory per stage, and saves the task confusion matrix to `prism/<dataset>__<prefix>__seed<seed>/routing_confusion_stage<t>.npy`.
