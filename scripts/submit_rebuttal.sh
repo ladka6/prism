@@ -15,8 +15,8 @@ for ds in "${DATASETS[@]}"; do
   done
 done
 
-# Oracle and task-order runs: the datasets the paper discusses most.
-for ds in ina inr cifar; do
+# Oracle and task-order runs, for the same datasets as above.
+for ds in "${DATASETS[@]}"; do
   sbatch --job-name="prism-$ds-oracle" scripts/run_arm.sh "$ds" oracle
   for arm in perm1 perm2 perm3; do
     sbatch --job-name="prism-$ds-$arm" scripts/run_arm.sh "$ds" "$arm"
