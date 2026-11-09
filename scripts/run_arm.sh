@@ -29,8 +29,19 @@ DATASET="${1:?dataset}"
 ARM="${2:?arm}"
 
 cd "${PRISM_DIR:-$HOME/prism}"
-source .venv/bin/activate
 mkdir -p logs
+
+# Use prism's own venv if it has the dependencies, else tosca-eval's (same
+# stack: torch, timm, scipy, easydict).
+DEPS="import torch, timm, scipy, easydict, tqdm"
+for VENV in "$PWD/.venv" "$HOME/tosca-eval/.venv"; do
+  if [ -f "$VENV/bin/activate" ]; then
+    source "$VENV/bin/activate"
+    if python -c "$DEPS" 2>/dev/null; then echo "using venv $VENV"; break; fi
+    deactivate
+  fi
+done
+python -c "$DEPS" || { echo "no venv with: $DEPS" >&2; exit 3; }
 
 case "$ARM" in
   base)     SET=(--set prefix=base) ;;
