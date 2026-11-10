@@ -188,7 +188,7 @@ Router ablations and instrumentation, selected with `--set key=value` (values ar
 ```bash
 python main.py --config exps/prism_ina.json --seed 1993 --set router_mode=task --set prefix=task
 sbatch --job-name=prism-ina-entropy scripts/run_arm.sh ina entropy   # one dataset, one arm, 5 seeds
-bash scripts/submit_rebuttal.sh                                      # the whole grid
+bash scripts/submit_rebuttal.sh "cifar cub inr omni vtab" "base entropy"   # chosen datasets x arms (asks first)
 python scripts/report.py                                             # mean ± std per (dataset, arm)
 python tests/test_router.py                                          # order-independence, numerically
 ```
